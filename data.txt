@@ -1,0 +1,15 @@
+Network 
+  Network Range -> 172.16.48.0 - 172.16.63.255
+  Subnet Mask -> 255.255.240.0
+  Gateway DNS -> 172.16.48.1
+
+
+Portenta
+  IP -> 172.16.49.72
+  Subnet Mark -> 255.255.240.0
+  DNS -> 172.16.48.1
+
+HMI
+  IP ->172.16.49.200
+  Subnet Mark -> 255.255.240.0
+  DNS -> 172.16.48.1
