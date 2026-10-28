@@ -1,26 +1,23 @@
 // Portenta H7 + Breakout - Call station (Mitsubishi GS2107 over Ethernet)
-// - Web page (plant network), password protected
-// - Pick who is calling (sender dropdown), type the location and a message, press Ring
-// - HMI shows RING + sender + location + message, and beeps until OK/CLEAR is pressed
-// - Optional: relay (PWM0 = pin 6) switches the 24 V buzzer
-// - Mitsubishi HMI reads everything over Modbus TCP (port 502)
+// - Web page (company network), password protected
+// - Pick who is calling, type the location and a message, press Ring
+// - HMI shows RING + sender + location + message and beeps
+// - HMI buttons Yes / No / I'm busy answer the call; the answer is shown in the browser
+// - Call ends on an answer, or after DISPLAY_MS with "No response"
+// - Relay (PWM0 = pin 6) switches the 24 V buzzer
 //
 // Libraries (Library Manager): ArduinoModbus, ArduinoRS485
 //
-// Modbus map (Portenta = Modbus TCP server)              ->  GT Designer3 (MODBUS) address
-//   reg 0       : 1 = call active, 0 = idle (HMI OK/CLEAR writes 0) -> 400001
-//   reg 1       : total call count                                -> 400002
-//   reg 2       : sender number (1..N)                            -> 400003
-//   reg 10..29  : message text, 40 ASCII chars                    -> 400011 (40 chars / 20 words)
-//   reg 60..69  : location text, 20 ASCII chars                   -> 400061 (20 chars / 10 words)
-//   reg 80..89  : sender text, 20 ASCII chars                     -> 400081 (20 chars / 10 words)
-//   reg 100     : System Signal 1-1 for the HMI (bit 14 = buzzer)  -> 400101
-//   reg 150..   : area the HMI writes its own status to           -> 400151
-//
-// GT Designer3: Common -> GOT Environmental Setting -> System Information
-//   [x] Use System Information
-//   Read Device  (Controller -> GOT) first device: 400101
-//   Write Device (GOT -> Controller) first device: 400151
+// Modbus map (Portenta = Modbus TCP server)                 -> GT Designer3 address
+//   reg 0       : 1 = call active, 0 = idle                   -> 400001
+//   reg 1       : total call count                            -> 400002
+//   reg 2       : sender number (1..N)                        -> 400003
+//   reg 3       : HMI reply: 1 = Yes, 2 = No, 3 = I'm busy    -> 400004  (HMI buttons write here)
+//   reg 4       : System Signal 1-1 (b15 = one-shot beep)     -> 400005  (System Information read)
+//   reg 10..29  : message text, 40 chars                      -> 400011
+//   reg 30..39  : location text, 20 chars                     -> 400031
+//   reg 40..49  : sender text, 20 chars                       -> 400041
+//   reg 50..    : HMI status write area                       -> 400051  (System Information write)
 
 #include <PortentaEthernet.h>
 #include <Ethernet.h>
@@ -33,7 +30,6 @@
 const char* PASSWORD = "project1234567890";
 
 // Who can send a call (shown in the "From" dropdown, max 20 characters each)
-// Who can send a call (shown in the "From" dropdown, max 20 characters each)
 const char* SENDERS[] = {
   "Rahul",
   "Navneet",
@@ -41,6 +37,7 @@ const char* SENDERS[] = {
   "Prarthana",
   "Mayank",
   "Niranjan",
+  "Nipun",
   "Arya",
   "Rohan",
   "Samanth",
@@ -49,35 +46,33 @@ const char* SENDERS[] = {
 };
 const int SENDER_COUNT = sizeof(SENDERS) / sizeof(SENDERS[0]);
 
-// The call ends automatically after CALL_TIMEOUT_MS (or earlier if OK/CLEAR is pressed)
+// The call ends when someone answers on the HMI, or after DISPLAY_MS ("No response")
 const unsigned long BUZZER_MS  = 0;       // 0 = beep for the whole call
-const unsigned long DISPLAY_MS = 10000;   // call cuts after 10 seconds
+const unsigned long DISPLAY_MS = 30000;   // call cuts after 10 seconds
 
 // Which buzzers sound on a call
 const bool USE_HMI_BEEP     = true;       // HMI built-in buzzer
 const bool USE_RELAY_BUZZER = true;       // 24 V buzzer on the relay
 
 // Sound pattern: true = "ring-ring" pattern, false = continuous
-const bool HMI_BEEP_PATTERN    = false;
+const bool HMI_BEEP_PATTERN    = false;    // needed for the one-shot beep (b15)
 const bool RELAY_RING_PATTERN  = false;
 
-// Text byte order for the HMI.
-// Mitsubishi GOT normally reads the FIRST character from the LOW byte -> false.
-// If the HMI shows letters swapped in pairs ("ELLO" as "EHLL"), change to true.
+// Text byte order for the HMI (true if letters show swapped in pairs)
 const bool TEXT_HIGH_BYTE_FIRST = false;
 
-// Network (plant LAN)
+// Network (company LAN)
 const bool USE_DHCP = false;
 byte mac[] = { 0x02, 0x00, 0x00, 0x10, 0x00, 0x02 };
-IPAddress staticIp(172, 16, 41, 72);
-IPAddress dns(172, 16, 40, 1);
-IPAddress gateway(172, 16, 40, 1);
-IPAddress subnet(255, 255, 248, 0);
+IPAddress staticIp(172, 16, 49, 72);
+IPAddress dns(172, 16, 48, 1);
+IPAddress gateway(172, 16, 48, 1);
+IPAddress subnet(255, 255, 240, 0);
 
 // Relay (5 V NPN module: ON when LOW)
 const int RELAY_PIN = 6;                  // Breakout PWM0
-const int RELAY_ON  = LOW;
-const int RELAY_OFF = HIGH;
+const int RELAY_ON  = LOW;   // PWM0 HIGH only while a call is active
+const int RELAY_OFF = HIGH;    // PWM0 LOW when idle
 
 // ---------------- Internals ----------------
 
@@ -85,32 +80,35 @@ const int MSG_MAX = 40;
 const int LOC_MAX = 20;
 const int SND_MAX = 20;
 
-const int REG_ACTIVE = 0;    // RING            -> 400001
-const int REG_COUNT  = 1;    // call count      -> 400002
-const int REG_SNDNUM = 2;    // sender number   -> 400003
-const int REG_SYS    = 4;    // HMI beep signal -> 400005 (System Information read device)
-const int REG_MSG    = 10;   // message  (40 chars) -> 400011
-const int REG_LOC    = 30;   // location (20 chars) -> 400031
-const int REG_SND    = 40;   // sender   (20 chars) -> 400041
-const int REG_GOT    = 50;   // HMI status write area -> 400051
+const int REG_ACTIVE = 0;    // RING              -> 400001
+const int REG_COUNT  = 1;    // call count        -> 400002
+const int REG_SNDNUM = 2;    // sender number     -> 400003
+const int REG_REPLY  = 3;    // HMI reply         -> 400004
+const int REG_SYS    = 4;    // HMI beep signal   -> 400005
+const int REG_MSG    = 10;   // message  (40)     -> 400011
+const int REG_LOC    = 30;   // location (20)     -> 400031
+const int REG_SND    = 40;   // sender   (20)     -> 400041
+const int REG_GOT    = 50;   // HMI status area   -> 400051
 const int REG_TOTAL  = 128;
+const int REG_TIME   = 100;   // 100 year, 101 month, 102 day, 103 hour, 104 minute, 105 second -> 400101..400106
+const int REG_TVALID = 106;   // 1 = time is valid, 0 = not set yet                              -> 400107
 
-const uint16_t HMI_BUZZER_BIT = (1 << 14);   // System Signal 1-1.b14 = Buzzer Output
+const uint16_t HMI_BUZZER_BIT = (1 << 14);   // System Signal 1-1.b15 = Buzzer One-shot
 
-EthernetServer server(80);         // web page
-EthernetServer modbusServer(502);  // Modbus TCP for the HMI
+EthernetServer server(80);
+EthernetServer modbusServer(502);
 EthernetClient modbusClient;
 ModbusTCPServer modbusTCP;
 bool networkUp = false;
 
-String sessionToken;               // new random token each time the Portenta starts
+String sessionToken;
 
 bool buzzerActive = false;
 bool callActive = false;
 unsigned long callStart = 0;
 uint16_t callCount = 0;
 
-struct Call { String msg; String loc; String snd; unsigned long at; };
+struct Call { String msg; String loc; String snd; String reply; String by; unsigned long at; };
 const int RECENT_MAX = 6;
 Call recent[RECENT_MAX];
 int recentCount = 0;
@@ -121,7 +119,6 @@ void ledBlue(bool on)  { digitalWrite(LEDB, on ? LOW : HIGH); }
 
 // ---------------- Buzzers ----------------
 
-// "ring-ring" pattern, repeats every 2 s: ON 400 ms, OFF 200 ms, ON 400 ms, OFF 1000 ms
 bool ringPatternOn(unsigned long t) {
   unsigned long p = t % 2000;
   return (p < 400) || (p >= 600 && p < 1000);
@@ -145,8 +142,8 @@ void allBuzzersOff() {
 // ---------------- Web pages ----------------
 
 const char CSS[] = R"rawliteral(
-:root{--bg:#fafafa;--card:#fff;--fg:#09090b;--muted:#71717a;--border:#e4e4e7;--ring:#a1a1aa;--primary:#18181b;--pfg:#fafafa;--danger:#dc2626;--dbg:#fef2f2;--ok:#16a34a;--obg:#f0fdf4}
-@media (prefers-color-scheme:dark){:root{--bg:#09090b;--card:#111113;--fg:#fafafa;--muted:#a1a1aa;--border:#27272a;--ring:#52525b;--primary:#fafafa;--pfg:#18181b;--dbg:#2a0a0a;--obg:#052e16}}
+:root{--bg:#fafafa;--card:#fff;--fg:#09090b;--muted:#71717a;--border:#e4e4e7;--ring:#a1a1aa;--primary:#18181b;--pfg:#fafafa;--danger:#dc2626;--dbg:#fef2f2;--ok:#16a34a;--obg:#f0fdf4;--warn:#b45309;--wbg:#fffbeb}
+@media (prefers-color-scheme:dark){:root{--bg:#09090b;--card:#111113;--fg:#fafafa;--muted:#a1a1aa;--border:#27272a;--ring:#52525b;--primary:#fafafa;--pfg:#18181b;--dbg:#2a0a0a;--obg:#052e16;--warn:#f59e0b;--wbg:#2a1a05}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}
 .wrap{max-width:540px;margin:0 auto;padding:32px 16px}
@@ -173,7 +170,7 @@ input:focus,select:focus{border-color:var(--ring);box-shadow:0 0 0 3px rgba(161,
 .badge.on{color:var(--danger);border-color:var(--danger);background:var(--dbg)}.badge.on .dot{background:var(--danger);animation:p 1s infinite}
 @keyframes p{50%{opacity:.25}}
 .toast{display:none;margin-top:12px;font-size:14px;padding:10px 12px;border-radius:8px}
-.toast.show{display:block}.toast.ok{background:var(--obg);color:var(--ok)}.toast.err{background:var(--dbg);color:var(--danger)}
+.toast.show{display:block}.toast.ok{background:var(--obg);color:var(--ok)}.toast.err{background:var(--dbg);color:var(--danger)}.toast.warn{background:var(--wbg);color:var(--warn)}
 .err{margin:0 0 16px;font-size:14px;padding:10px 12px;border-radius:8px;background:var(--dbg);color:var(--danger)}
 .rh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
 h2{font-size:15px;font-weight:600;margin:0}
@@ -182,6 +179,12 @@ ul{list-style:none;margin:0;padding:0}
 li{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:12px 0;border-top:1px solid var(--border);font-size:14px}
 li:first-child{border-top:0}
 .m{font-weight:500;word-break:break-word}.l{color:var(--muted);font-size:13px;margin-top:2px}.t{color:var(--muted);font-size:12px;white-space:nowrap}
+.r{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.pill{font-size:12px;font-weight:500;padding:2px 10px;border-radius:999px;border:1px solid var(--border);color:var(--muted);white-space:nowrap}
+.pill.yes{color:var(--ok);background:var(--obg);border-color:transparent}
+.pill.no{color:var(--danger);background:var(--dbg);border-color:transparent}
+.pill.busy{color:var(--warn);background:var(--wbg);border-color:transparent}
+.pill.wait{color:var(--fg)}
 .empty{color:var(--muted);justify-content:center}
 .clr{background:none;border:1px solid var(--border);color:var(--fg);border-radius:8px;height:30px;padding:0 10px;font:inherit;font-size:12px;cursor:pointer;display:none}
 .clr.show{display:inline-block}
@@ -218,35 +221,41 @@ const char MAIN_BODY_BOTTOM[] = R"rawliteral(</select></div>
 <button class="btn" id="b" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg><span id="bl">Ring</span></button>
 <div class="toast" id="toast"></div>
 </form>
-<div class="card"><div class="rh"><h2>Recent calls</h2><div><span class="stat" id="count"></span> <button class="clr" id="clr" type="button">Clear active call</button></div></div>
+<div class="card"><div class="rh"><h2>Recent calls</h2><div><span class="stat" id="count"></span> <button class="clr" id="clr" type="button">Cancel call</button></div></div>
 <ul id="recent"><li class="empty">No calls yet</li></ul></div>
-<footer><span>Portenta H7 on the plant network</span><a href="/logout">Sign out</a></footer>
+<footer><span>Developed by Projects Team</span><a href="/logout">Sign out</a></footer>
 </div>
 <script>
 const $=i=>document.getElementById(i);
-const msg=$('msg'),loc=$('loc'),snd=$('snd'),b=$('b'),toast=$('toast');let tt;
+const msg=$('msg'),loc=$('loc'),snd=$('snd'),b=$('b'),toast=$('toast');let tt,prevActive=null;
 msg.addEventListener('input',()=>{$('cc').textContent=msg.value.length+'/40'});
 loc.addEventListener('input',()=>{$('lc').textContent=loc.value.length+'/20'});
-function show(t,ok){toast.textContent=t;toast.className='toast show '+(ok?'ok':'err');clearTimeout(tt);tt=setTimeout(()=>toast.className='toast',5000)}
+function show(t,kind){toast.textContent=t;toast.className='toast show '+kind;clearTimeout(tt);tt=setTimeout(()=>toast.className='toast',8000)}
 function ago(s){if(s<60)return 'Just now';if(s<3600)return Math.floor(s/60)+' min ago';return Math.floor(s/3600)+' h ago'}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function kindOf(r){return r==='Yes'?'yes':r==='No'?'no':r==="I'm busy"?'busy':'none'}
+function pill(r,by){if(!r)return '<span class="pill wait">Waiting</span>';return '<span class="pill '+kindOf(r)+'">'+esc(r)+(by?' &middot; '+esc(by):'')+'</span>'}
+function localEpoch(){const d=new Date();return Math.floor(d.getTime()/1000)-d.getTimezoneOffset()*60}
 async function api(u){const r=await fetch(u,{credentials:'same-origin'});if(r.status===401){window.location.href='/login';throw new Error('auth')}return r.json()}
 $('f').addEventListener('submit',async e=>{e.preventDefault();
-if(snd.value===''){show('Select who is calling.',false);snd.focus();return}
-if(!loc.value.trim()){show('Enter a location.',false);loc.focus();return}
+if(snd.value===''){show('Select who is calling.','err');snd.focus();return}
+if(!loc.value.trim()){show('Enter a location.','err');loc.focus();return}
 b.disabled=true;$('bl').textContent='Sending';
 try{const j=await api('/ring?snd='+snd.value+'&loc='+encodeURIComponent(loc.value)+'&msg='+encodeURIComponent(msg.value));
-if(j.ok){show('Call sent to '+loc.value.trim()+'.',true);msg.value='';$('cc').textContent='0/40';poll()}else show(j.error||'Call failed. Try again.',false)}
-catch(err){if(err.message!=='auth')show("Couldn't reach the device. Check the network.",false)}
+if(j.ok){show('Call sent to '+loc.value.trim()+'. Waiting for a reply...','ok');msg.value='';$('cc').textContent='0/40';poll()}else show(j.error||'Call failed. Try again.','err')}
+catch(err){if(err.message!=='auth')show("Couldn't reach the device. Check the network.",'err')}
 b.disabled=false;$('bl').textContent='Ring'});
 $('clr').addEventListener('click',async()=>{try{await api('/clear');poll()}catch(e){}});
-async function poll(){try{const j=await api('/status');
-$('badge').className='badge '+(j.active?'on':'ok');$('bt').textContent=j.active?'Call active':'Online';
+async function poll(){try{const j=await api('/status?t='+localEpoch());
+$('badge').className='badge '+(j.active?'on':'ok');$('bt').textContent=j.active?'Waiting for reply':'Online';
 $('clr').className='clr'+(j.active?' show':'');
 $('count').textContent=j.count+' total';
-const ul=$('recent');ul.innerHTML=j.recent.length?j.recent.map(c=>'<li><div><div class="m">'+esc(c.msg)+'</div><div class="l">'+esc(c.loc)+' &middot; from '+esc(c.snd)+'</div></div><span class="t">'+ago(c.age)+'</span></li>').join(''):'<li class="empty">No calls yet</li>'}
+if(prevActive===true&&!j.active&&j.recent.length){const c=j.recent[0];const r=c.reply||'No response';const k=kindOf(r);
+show((c.by?c.by:c.loc)+' replied: '+r, k==='yes'?'ok':k==='no'?'err':'warn')}
+prevActive=j.active;
+const ul=$('recent');ul.innerHTML=j.recent.length?j.recent.map(c=>'<li><div><div class="m">'+esc(c.msg)+'</div><div class="l">'+esc(c.loc)+' &middot; from '+esc(c.snd)+'</div></div><div class="r">'+pill(c.reply,c.by)+'<span class="t">'+ago(c.age)+'</span></div></li>').join(''):'<li class="empty">No calls yet</li>'}
 catch(e){if(e.message!=='auth'){$('badge').className='badge';$('bt').textContent='Offline'}}}
-poll();setInterval(poll,2000);
+poll();setInterval(poll,1500);
 </script></body></html>
 )rawliteral";
 
@@ -280,7 +289,6 @@ String getParam(const String& query, const char* key) {
   return "";
 }
 
-// Keep plain printable ASCII only (what the HMI can show), limit length
 String cleanText(const String& in, int maxLen) {
   String o;
   for (unsigned i = 0; i < in.length() && (int)o.length() < maxLen; i++) {
@@ -301,7 +309,6 @@ String jsonEsc(const String& s) {
   return o;
 }
 
-// 2 characters per register, padded with spaces
 void writeText(int startReg, int numRegs, const String& s) {
   for (int i = 0; i < numRegs; i++) {
     uint8_t first  = (2 * i < (int)s.length())     ? (uint8_t)s[2 * i]     : ' ';
@@ -317,8 +324,18 @@ void addRecent(const String& msg, const String& loc, const String& snd) {
   recent[0].msg = msg;
   recent[0].loc = loc;
   recent[0].snd = snd;
+    recent[0].reply = "";          // "" = still waiting
+  recent[0].by = "";
   recent[0].at = millis();
   if (recentCount < RECENT_MAX) recentCount++;
+}
+
+// Save the answer on the current (newest) call
+void setReply(const String& r, const String& by = "") {
+  if (recentCount > 0 && recent[0].reply.length() == 0) {
+    recent[0].reply = r;
+    recent[0].by = by;
+  }
 }
 
 void makeSessionToken() {
@@ -327,9 +344,50 @@ void makeSessionToken() {
   for (int i = 0; i < 4; i++) sessionToken += String((uint32_t)random(0x7FFFFFFF), HEX);
 }
 
+// ---------------- Clock (time from the browser) ----------------
+
+const long MIN_VALID_TIME = 1700000000;   // anything before Nov 2023 = clock not set
+
+// The browser sends its local time as seconds; adjust the Portenta clock if it is off by > 2 s
+void syncTimeFromBrowser(const String& tStr) {
+  long t = tStr.toInt();
+  if (t < MIN_VALID_TIME) return;
+  long now = (long)time(NULL);
+  if (now < MIN_VALID_TIME || abs(now - t) > 2) {
+    set_time((time_t)t);
+    Serial.println("Clock set from browser");
+  }
+}
+
+// Write the current local time to the HMI registers
+void updateClockRegisters() {
+  static unsigned long last = 0;
+  if (millis() - last < 500) return;
+  last = millis();
+
+  time_t now = time(NULL);
+  if ((long)now < MIN_VALID_TIME) {
+    for (int i = 0; i < 6; i++) modbusTCP.holdingRegisterWrite(REG_TIME + i, 0);
+    modbusTCP.holdingRegisterWrite(REG_TVALID, 0);
+    return;
+  }
+  struct tm* t = gmtime(&now);   // stored value is already local time
+  modbusTCP.holdingRegisterWrite(REG_TIME + 0, t->tm_year + 1900);
+  modbusTCP.holdingRegisterWrite(REG_TIME + 1, t->tm_mon + 1);
+  modbusTCP.holdingRegisterWrite(REG_TIME + 2, t->tm_mday);
+  modbusTCP.holdingRegisterWrite(REG_TIME + 3, t->tm_hour);
+  modbusTCP.holdingRegisterWrite(REG_TIME + 4, t->tm_min);
+  modbusTCP.holdingRegisterWrite(REG_TIME + 5, t->tm_sec);
+  modbusTCP.holdingRegisterWrite(REG_TVALID, 1);
+}
+
 // ---------------- Call logic ----------------
+void stopCall();   // declared here so startCall() can use it
 
 void startCall(const String& msg, const String& loc, int sndIndex) {
+  // A new call while one is active: close the old one first
+  if (callActive) { setReply("No response"); stopCall(); }
+
   String snd = SENDERS[sndIndex];
   callCount++;
 
@@ -338,6 +396,7 @@ void startCall(const String& msg, const String& loc, int sndIndex) {
   writeText(REG_SND, SND_MAX / 2, snd);
   modbusTCP.holdingRegisterWrite(REG_SNDNUM, sndIndex + 1);
   modbusTCP.holdingRegisterWrite(REG_COUNT, callCount);
+  modbusTCP.holdingRegisterWrite(REG_REPLY, 0);
   modbusTCP.holdingRegisterWrite(REG_ACTIVE, 1);
 
   buzzerActive = true;
@@ -363,23 +422,43 @@ void stopCall() {
   callActive = false;
   ledGreen(false);
   modbusTCP.holdingRegisterWrite(REG_ACTIVE, 0);
+  modbusTCP.holdingRegisterWrite(REG_REPLY, 0);
 }
 
 void updateCall() {
   if (!callActive) return;
 
-  // OK/CLEAR pressed on the HMI (wrote 0 to 400001) -> stop everything
-  if (modbusTCP.holdingRegisterRead(REG_ACTIVE) == 0) {
+  // Answer from the HMI buttons (400004):
+  // 1/2/3 = Harish Yes/No/Busy, 4/5/6 = Piyush Yes/No/Busy
+  uint16_t reply = modbusTCP.holdingRegisterRead(REG_REPLY);
+  if (reply >= 1 && reply <= 6) {
+    String who = (reply <= 3) ? "Harish" : "Piyush";
+    int a = (reply - 1) % 3;
+    String r = (a == 0) ? "Yes" : (a == 1) ? "No" : "I'm busy";
+    setReply(r, who);
     stopCall();
-    Serial.println("Call cleared from HMI");
+    Serial.print("Reply from ");
+    Serial.print(who);
+    Serial.print(": ");
+    Serial.println(r);
+    return;
+  }
+
+  // Old OK/CLEAR button (wrote 0 to 400001) still works
+  if (modbusTCP.holdingRegisterRead(REG_ACTIVE) == 0) {
+    setReply("OK");
+    stopCall();
+    Serial.println("Call acknowledged on HMI");
     return;
   }
 
   unsigned long elapsed = millis() - callStart;
 
-  // Optional safety limit for the whole call (0 = no limit)
+  // Timer: nobody answered
   if (DISPLAY_MS > 0 && elapsed >= DISPLAY_MS) {
+    setReply("No response");
     stopCall();
+    Serial.println("Call ended: no response");
     return;
   }
 
@@ -397,7 +476,7 @@ void updateCall() {
   }
 }
 
-// ---------------- Modbus TCP (non-blocking, keeps the HMI connection open) ----------------
+// ---------------- Modbus TCP (HMI) ----------------
 
 void handleModbus() {
   EthernetClient newClient = modbusServer.available();
@@ -430,7 +509,7 @@ struct Request {
 
 bool readRequest(EthernetClient& c, Request& r) {
   c.setTimeout(300);
-  String line = c.readStringUntil('\n');   // e.g. "GET /ring?loc=..&msg=.. HTTP/1.1"
+  String line = c.readStringUntil('\n');
   line.trim();
   int sp1 = line.indexOf(' ');
   int sp2 = line.indexOf(' ', sp1 + 1);
@@ -442,7 +521,6 @@ bool readRequest(EthernetClient& c, Request& r) {
   r.path  = (q >= 0) ? target.substring(0, q) : target;
   r.query = (q >= 0) ? target.substring(q + 1) : "";
 
-  // Headers
   int contentLength = 0;
   while (true) {
     String h = c.readStringUntil('\n');
@@ -454,7 +532,6 @@ bool readRequest(EthernetClient& c, Request& r) {
     else if (hl.startsWith("content-length:")) contentLength = h.substring(15).toInt();
   }
 
-  // Body (only small form posts, e.g. the login password)
   if (contentLength > 0 && contentLength <= 512) {
     char buf[513];
     size_t n = c.readBytes(buf, contentLength);
@@ -544,7 +621,9 @@ void sendStatus(EthernetClient& c) {
     if (i) j += ",";
     j += "{\"msg\":\"" + jsonEsc(recent[i].msg) +
          "\",\"loc\":\"" + jsonEsc(recent[i].loc) +
-         "\",\"snd\":\"" + jsonEsc(recent[i].snd) + "\",\"age\":";
+         "\",\"snd\":\"" + jsonEsc(recent[i].snd) +
+         "\",\"reply\":\"" + jsonEsc(recent[i].reply) +
+         "\",\"by\":\"" + jsonEsc(recent[i].by) + "\",\"age\":";
     j += (millis() - recent[i].at) / 1000;
     j += "}";
   }
@@ -565,7 +644,6 @@ void handleWeb() {
 
   bool loggedIn = isLoggedIn(r);
 
-  // ----- Pages that work without logging in -----
   if (r.path == "/login") {
     if (r.method == "POST") {
       String pw = getParam(r.body, "password");
@@ -588,7 +666,6 @@ void handleWeb() {
   } else if (r.path == "/favicon.ico") {
     sendHeader(client, 404, "text/plain");
 
-  // ----- Everything else needs a login -----
   } else if (!loggedIn) {
     if (r.path == "/") {
       sendRedirect(client, "/login", "");
@@ -620,13 +697,13 @@ void handleWeb() {
     }
 
   } else if (r.path == "/clear") {
-    stopCall();
+    if (callActive) { setReply("Cancelled"); stopCall(); }
     sendHeader(client, 200, "application/json");
     client.print("{\"ok\":true}");
 
   } else if (r.path == "/status") {
+    syncTimeFromBrowser(getParam(r.query, "t"));
     sendStatus(client);
-
   } else {
     sendHeader(client, 404, "text/plain");
     client.print("Not found");
@@ -639,7 +716,7 @@ void handleWeb() {
 // ---------------- Setup / loop ----------------
 
 void setup() {
-  digitalWrite(RELAY_PIN, RELAY_OFF);   // relay OFF before enabling the output
+  digitalWrite(RELAY_PIN, RELAY_OFF);
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, RELAY_OFF);
 
@@ -663,7 +740,6 @@ void setup() {
 
   makeSessionToken();
 
-  // Modbus TCP server (unit ID 1)
   if (!modbusTCP.begin(1)) Serial.println("Failed to start Modbus TCP server");
   modbusTCP.configureHoldingRegisters(0, REG_TOTAL);
   for (int i = 0; i < REG_TOTAL; i++) modbusTCP.holdingRegisterWrite(i, 0);
@@ -678,7 +754,7 @@ void setup() {
     modbusServer.begin();
     Serial.print("Ready. Open http://");
     Serial.print(Ethernet.localIP());
-    Serial.println("/   (HMI: Modbus TCP port 502)");
+    Serial.println("/ (HMI: Modbus TCP port 502)");
   } else {
     Serial.println("No network. USB test mode.");
   }
@@ -688,6 +764,7 @@ void setup() {
 void loop() {
   if (networkUp) handleModbus();
   updateCall();
+  updateClockRegisters();
 
   ledRed(!networkUp || Ethernet.linkStatus() != LinkON);
 
